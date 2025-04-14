@@ -16,10 +16,8 @@ interface Options {
 
 async function ghcommit(options: Options) {
   const githubToken = process.env.GITHUB_TOKEN;
-  if (!githubToken || !/^[a-zA-Z0-9_]{40}$/.test(githubToken)) {
-    core.setFailed(
-      "Invalid or missing GITHUB_TOKEN. Ensure it is set and has the necessary permissions (e.g., 'repo' scope for private repositories)."
-    );
+  if (!githubToken) {
+    core.setFailed("GITHUB_TOKEN environment variable must be set");
     return;
   }
 
