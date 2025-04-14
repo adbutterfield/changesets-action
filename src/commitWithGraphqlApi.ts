@@ -1,6 +1,6 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
-import * as exec from "@actions/exec";
+import { exec } from "@actions/exec";
 import { graphql } from "@octokit/graphql";
 import * as fs from "node:fs";
 import * as process from "node:process";
@@ -37,7 +37,7 @@ export async function commitWithGraphqlApi({
     }
 
     // Make sure Git sees our workspace as safe
-    await exec.exec("git", [
+    await exec("git", [
       "config",
       "--global",
       "--add",
@@ -94,9 +94,11 @@ export async function commitWithGraphqlApi({
       },
     });
 
-    // We can optionally figure out the HEAD SHA from context
-    const expectedHeadOid =
-      github.context.payload.pull_request?.head.sha ?? undefined;
+    let expectedHeadOid = github.context.sha;
+    if (!expectedHeadOid) {
+      // fallback to local HEAD
+      expectedHeadOid = await getLocalHeadSHA();
+    }
 
     // Prepare commit message parts
     const [headline, body] = parseMessage(commitMessage);
@@ -124,7 +126,7 @@ export async function commitWithGraphqlApi({
         additions,
         deletions,
       },
-      expectedHeadOid, // may be undefined if no PR context
+      expectedHeadOid,
     };
 
     core.info(`Creating commit on ${repo}@${branch}...`);
@@ -165,8 +167,7 @@ function execCommand(command: string, args: string[]): Promise<string> {
       },
     };
 
-    exec
-      .exec(command, args, options)
+    exec(command, args, options)
       .then(() => resolve(output))
       .catch((err) => reject(new Error(`${err.message}\n${error}`)));
   });
@@ -196,4 +197,17 @@ async function base64EncodeFile(filePath: string): Promise<string> {
 function parseMessage(msg: string): [string, string] {
   const parts = msg.split("\n", 2);
   return [parts[0], parts[1] ?? ""];
+}
+
+async function getLocalHeadSHA(): Promise<string> {
+  let headSha = "";
+  const options = {
+    listeners: {
+      stdout: (data: Buffer) => {
+        headSha += data.toString();
+      },
+    },
+  };
+  await exec("git", ["rev-parse", "HEAD"], options);
+  return headSha.trim();
 }
