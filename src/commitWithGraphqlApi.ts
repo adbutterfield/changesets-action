@@ -5,119 +5,6 @@ import { graphql } from "@octokit/graphql";
 import * as fs from "node:fs";
 import * as process from "node:process";
 
-interface Options {
-  adds: string[];
-  deletes: string[];
-  message: string;
-  repository: string;
-  branch: string;
-  headSHA?: string;
-}
-
-async function ghcommit(options: Options) {
-  const githubToken = process.env.GITHUB_TOKEN;
-  if (!githubToken) {
-    core.setFailed("GITHUB_TOKEN environment variable must be set");
-    return;
-  }
-
-  if (!options.message) {
-    core.setFailed("Commit message is required");
-    return;
-  }
-
-  if (options.adds.length === 0 && options.deletes.length === 0) {
-    core.setFailed("No files to commit.");
-    return;
-  }
-
-  const graphqlWithAuth = graphql.defaults({
-    headers: {
-      authorization: `token ${githubToken}`,
-    },
-  });
-
-  const [headline, body] = parseMessage(options.message);
-
-  const expectedHeadOid =
-    options.headSHA ?? github.context.payload.pull_request?.head.sha;
-
-  const additions = await Promise.all(
-    options.adds.map(async (filePath) => ({
-      path: filePath,
-      contents: await base64EncodeFile(filePath),
-    }))
-  );
-
-  const deletions = options.deletes.map((filePath) => ({
-    path: filePath,
-  }));
-
-  // GraphQL mutation to create a commit on a specific branch.
-  // Input: CreateCommitOnBranchInput object containing branch details, commit message, file changes, and expected head OID.
-  // Output: The URL of the newly created commit.
-  const mutation = `
-      mutation createCommitOnBranch($input: CreateCommitOnBranchInput!) {
-        createCommitOnBranch(input: $input) {
-          commit {
-            url
-          }
-        }
-      }
-    `;
-
-  const input = {
-    branch: {
-      repositoryNameWithOwner: options.repository,
-      branchName: options.branch,
-    },
-    message: {
-      headline,
-      body,
-    },
-    fileChanges: {
-      additions,
-      deletions,
-    },
-    expectedHeadOid,
-  };
-
-  try {
-    const response = await graphqlWithAuth<{
-      createCommitOnBranch: { commit: { url: string } };
-    }>(mutation, { input });
-    core.info(`graphql response: ${response}`);
-    core.info(
-      `Success. New commit: ${response.createCommitOnBranch.commit.url}`
-    );
-  } catch (error) {
-    if (error instanceof Error) {
-      core.setFailed(`Failed to create commit: ${error.message}`);
-    } else {
-      core.setFailed("Failed to create commit: An unknown error occurred");
-    }
-  }
-}
-
-function parseMessage(msg: string): [string, string] {
-  const parts = msg.split("\n", 2);
-  return [parts[0], parts[1] || ""];
-}
-
-async function base64EncodeFile(filePath: string): Promise<string> {
-  try {
-    const fileContent = await fs.promises.readFile(filePath);
-    return fileContent.toString("base64");
-  } catch (error) {
-    core.error(
-      `Failed to read file: ${filePath}. Error: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    );
-    throw new Error(`Unable to encode file: ${filePath}`);
-  }
-}
-
 export async function commitWithGraphqlApi({
   commitMessage,
   repo,
@@ -128,16 +15,28 @@ export async function commitWithGraphqlApi({
   branch: string;
 }) {
   try {
-    const filePatterns = ["**/package.json", "**/CHANGELOG.md", ".changeset/*"];
+    // 1) Ensure we have a GitHub token
+    const githubToken = process.env.GITHUB_TOKEN;
+    if (!githubToken) {
+      core.setFailed("GITHUB_TOKEN environment variable must be set");
+      return;
+    }
 
+    if (!commitMessage) {
+      core.setFailed("A commit message is required.");
+      return;
+    }
+
+    // 2) Collect changed files using Git
+    const filePatterns = ["**/package.json", "**/CHANGELOG.md", ".changeset/*"];
     const workspace = process.env.GITHUB_WORKSPACE || "/github/workspace";
     if (!process.env.GITHUB_WORKSPACE) {
       core.warning(
-        "GITHUB_WORKSPACE environment variable is not set. Falling back to default: /github/workspace"
+        "GITHUB_WORKSPACE is not set. Falling back to default: /github/workspace"
       );
     }
 
-    // Configure git to allow the workspace directory
+    // Make sure Git sees our workspace as safe
     await exec.exec("git", [
       "config",
       "--global",
@@ -146,11 +45,10 @@ export async function commitWithGraphqlApi({
       workspace,
     ]);
 
+    const gitStatusOutput = await getGitStatus(filePatterns);
+    // Parse the porcelain output to gather additions and deletions
     const adds: string[] = [];
     const deletes: string[] = [];
-
-    // Get the git status in porcelain format
-    const gitStatusOutput = await getGitStatus(filePatterns);
 
     for (const line of gitStatusOutput.split("\0")) {
       if (!line) continue;
@@ -158,20 +56,9 @@ export async function commitWithGraphqlApi({
       const indexStatus = line[0];
       const treeStatus = line[1];
       const filename = line.slice(3);
-
-      if (indexStatus === "R" || treeStatus === "R") {
-        const [oldFilename, newFilename] = filename.split("\0");
-        core.info(
-          `Renamed file detected: Old Filename: ${oldFilename}, New Filename: ${newFilename}`
-        );
-        adds.push(newFilename);
-        deletes.push(oldFilename);
-        continue;
-      }
-
-      core.info(`Filename: ${filename}`);
-      core.info(`Index Status: ${indexStatus}`);
-      core.info(`Tree Status: ${treeStatus}`);
+      core.info(
+        `Filename: ${filename} (index=${indexStatus}, tree=${treeStatus})`
+      );
 
       if (
         ["A", "M", "T"].includes(treeStatus) ||
@@ -186,40 +73,86 @@ export async function commitWithGraphqlApi({
     }
 
     if (adds.length === 0 && deletes.length === 0) {
-      core.info("No changes detected, exiting");
+      core.info("No changes detected. Exiting without commit.");
       return;
     }
 
-    const ghcommitArgs = [
-      "-b",
-      branch,
-      "-r",
-      repo,
-      "-m",
-      commitMessage,
-      ...adds.map((file) => `--add=${file}`),
-      ...deletes.map((file) => `--delete=${file}`),
-    ];
+    // 3) Perform the GraphQL commit
+    // Prepare base64-encoded contents for all added files
+    const additions = await Promise.all(
+      adds.map(async (filePath) => ({
+        path: filePath,
+        contents: await base64EncodeFile(filePath),
+      }))
+    );
+    // Deletions are trivial to represent
+    const deletions = deletes.map((filePath) => ({ path: filePath }));
 
-    core.info(`ghcommit args: ${ghcommitArgs.join(" ")}`);
-
-    await ghcommit({
-      branch,
-      repository: repo,
-      message: commitMessage,
-      adds,
-      deletes,
+    const graphqlWithAuth = graphql.defaults({
+      headers: {
+        authorization: `token ${githubToken}`,
+      },
     });
+
+    // We can optionally figure out the HEAD SHA from context
+    const expectedHeadOid =
+      github.context.payload.pull_request?.head.sha ?? undefined;
+
+    // Prepare commit message parts
+    const [headline, body] = parseMessage(commitMessage);
+
+    // Execute the GraphQL mutation
+    const mutation = `
+      mutation createCommitOnBranch($input: CreateCommitOnBranchInput!) {
+        createCommitOnBranch(input: $input) {
+          commit {
+            url
+          }
+        }
+      }
+    `;
+    const input = {
+      branch: {
+        repositoryNameWithOwner: repo,
+        branchName: branch,
+      },
+      message: {
+        headline,
+        body,
+      },
+      fileChanges: {
+        additions,
+        deletions,
+      },
+      expectedHeadOid, // may be undefined if no PR context
+    };
+
+    core.info(`Creating commit on ${repo}@${branch}...`);
+    const response = await graphqlWithAuth<{
+      createCommitOnBranch: { commit: { url: string } };
+    }>(mutation, { input });
+
+    const commitUrl = response.createCommitOnBranch.commit.url;
+    core.info(`Success! New commit: ${commitUrl}`);
   } catch (error: any) {
-    core.setFailed(error.message);
+    core.setFailed(error instanceof Error ? error.message : String(error));
   }
 }
 
+/**
+ * Retrieve the git status in a machine-readable format
+ */
 async function getGitStatus(filePatterns: string[]): Promise<string> {
+  // -s => short format
+  // --porcelain=v1 => stable, script-friendly
+  // -z => separate entries with null characters
   const args = ["status", "-s", "--porcelain=v1", "-z", "--", ...filePatterns];
   return execCommand("git", args);
 }
 
+/**
+ * Helper to run a shell command with GitHub Action's tooling
+ */
 function execCommand(command: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     let output = "";
@@ -237,4 +170,30 @@ function execCommand(command: string, args: string[]): Promise<string> {
       .then(() => resolve(output))
       .catch((err) => reject(new Error(`${err.message}\n${error}`)));
   });
+}
+
+/**
+ * Reads a file and returns its base64-encoded contents.
+ */
+async function base64EncodeFile(filePath: string): Promise<string> {
+  try {
+    const fileContent = await fs.promises.readFile(filePath);
+    return fileContent.toString("base64");
+  } catch (error) {
+    core.error(
+      `Failed to read file: ${filePath}. Error: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    throw new Error(`Unable to encode file: ${filePath}`);
+  }
+}
+
+/**
+ * Splits a commit message into [headline, body].
+ * If there is only one line, body will be "".
+ */
+function parseMessage(msg: string): [string, string] {
+  const parts = msg.split("\n", 2);
+  return [parts[0], parts[1] ?? ""];
 }
