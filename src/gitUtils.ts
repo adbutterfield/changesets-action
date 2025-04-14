@@ -53,10 +53,6 @@ export const reset = async (
 
 export const commitAll = async (message: string) => {
   const apiProtocol = core.getInput("apiProtocol");
-  if (apiProtocol === "rest") {
-    await exec("git", ["add", "."]);
-    await exec("git", ["commit", "-m", message]);
-  }
   if (apiProtocol === "graphql") {
     let repo = `${github.context.repo.owner}/${github.context.repo.repo}`;
     const branch = github.context.ref.replace("refs/heads/", "");
@@ -69,6 +65,9 @@ export const commitAll = async (message: string) => {
     }).catch((error) => {
       core.setFailed(error.message);
     });
+  } else {
+    await exec("git", ["add", "."]);
+    await exec("git", ["commit", "-m", message]);
   }
 };
 

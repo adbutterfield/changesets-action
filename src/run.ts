@@ -379,7 +379,7 @@ export async function runVersion({
     await gitUtils.commitAll(finalCommitMessage);
   }
 
-  if (core.getInput("apiProtocol") === "rest") {
+  if (core.getInput("apiProtocol") !== "graphql") {
     await gitUtils.push(versionBranch, { force: true });
   }
 
