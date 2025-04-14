@@ -16,8 +16,10 @@ interface Options {
 
 async function ghcommit(options: Options) {
   const githubToken = process.env.GITHUB_TOKEN;
-  if (!githubToken) {
-    core.setFailed("GITHUB_TOKEN environment variable must be set");
+  if (!githubToken || !/^[a-zA-Z0-9_]{40}$/.test(githubToken)) {
+    core.setFailed(
+      "Invalid or missing GITHUB_TOKEN. Ensure it is set and has the necessary permissions (e.g., 'repo' scope for private repositories)."
+    );
     return;
   }
 
@@ -53,15 +55,18 @@ async function ghcommit(options: Options) {
     path: filePath,
   }));
 
+  // GraphQL mutation to create a commit on a specific branch.
+  // Input: CreateCommitOnBranchInput object containing branch details, commit message, file changes, and expected head OID.
+  // Output: The URL of the newly created commit.
   const mutation = `
-    mutation createCommitOnBranch($input: CreateCommitOnBranchInput!) {
-      createCommitOnBranch(input: $input) {
-        commit {
-          url
+      mutation createCommitOnBranch($input: CreateCommitOnBranchInput!) {
+        createCommitOnBranch(input: $input) {
+          commit {
+            url
+          }
         }
       }
-    }
-  `;
+    `;
 
   const input = {
     branch: {
@@ -102,8 +107,17 @@ function parseMessage(msg: string): [string, string] {
 }
 
 async function base64EncodeFile(filePath: string): Promise<string> {
-  const fileContent = await fs.promises.readFile(filePath);
-  return fileContent.toString("base64");
+  try {
+    const fileContent = await fs.promises.readFile(filePath);
+    return fileContent.toString("base64");
+  } catch (error) {
+    core.error(
+      `Failed to read file: ${filePath}. Error: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    throw new Error(`Unable to encode file: ${filePath}`);
+  }
 }
 
 export async function commitWithGraphqlApi({
@@ -118,9 +132,11 @@ export async function commitWithGraphqlApi({
   try {
     const filePatterns = ["**/package.json", "**/CHANGELOG.md", ".changeset/*"];
 
-    const workspace = process.env.GITHUB_WORKSPACE;
-    if (!workspace) {
-      throw new Error("GITHUB_WORKSPACE environment variable is not set");
+    const workspace = process.env.GITHUB_WORKSPACE || "/github/workspace";
+    if (!process.env.GITHUB_WORKSPACE) {
+      core.warning(
+        "GITHUB_WORKSPACE environment variable is not set. Falling back to default: /github/workspace"
+      );
     }
 
     // Configure git to allow the workspace directory
