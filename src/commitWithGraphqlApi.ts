@@ -56,6 +56,7 @@ export async function commitWithGraphqlApi({
       const indexStatus = line[0];
       const treeStatus = line[1];
       const filename = line.slice(3);
+
       core.info(
         `Filename: ${filename} (index=${indexStatus}, tree=${treeStatus})`
       );
@@ -77,65 +78,91 @@ export async function commitWithGraphqlApi({
       return;
     }
 
-    // 3) Perform the GraphQL commit
-    // Prepare base64-encoded contents for all added files
-    const additions = await Promise.all(
-      adds.map(async (filePath) => ({
-        path: filePath,
-        contents: await base64EncodeFile(filePath),
-      }))
-    );
-    // Deletions are trivial to represent
-    const deletions = deletes.map((filePath) => ({ path: filePath }));
-
+    // 3) Prepare the GraphQL client
     const graphqlWithAuth = graphql.defaults({
       headers: {
         authorization: `token ${githubToken}`,
       },
     });
 
+    // We need an expected HEAD OID. If context.sha is not available,
+    // fallback to the local HEAD from git.
     let expectedHeadOid = github.context.sha;
     if (!expectedHeadOid) {
-      // fallback to local HEAD
       expectedHeadOid = await getLocalHeadSHA();
     }
 
-    // Prepare commit message parts
-    const [headline, body] = parseMessage(commitMessage);
+    // Prepare base64-encoded contents for all added files
+    const allAdditions = await Promise.all(
+      adds.map(async (filePath) => ({
+        path: filePath,
+        contentBase64: await base64EncodeFile(filePath),
+      }))
+    );
+    // Deletions are trivial in payload, so you can apply them all at once if you prefer
+    const allDeletions = deletes.map((filePath) => ({ path: filePath }));
 
-    // Execute the GraphQL mutation
-    const mutation = `
-      mutation createCommitOnBranch($input: CreateCommitOnBranchInput!) {
-        createCommitOnBranch(input: $input) {
-          commit {
-            url
+    // 4) Chunk the additions to avoid exceeding API limits
+    const { chunkedAdditions, chunkedDeletions } = chunkChangesBySize(
+      allAdditions,
+      allDeletions,
+      1000 * 1000 // ~1 MB
+    );
+
+    // 5) Commit each chunk in sequence, updating the HEAD each time
+    for (let i = 0; i < chunkedAdditions.length; i++) {
+      const addsSubset = chunkedAdditions[i];
+      const deletesSubset = chunkedDeletions[i];
+
+      // Prepare commit message parts
+      const [headline, body] = parseMessage(commitMessage);
+
+      const mutation = `
+        mutation createCommitOnBranch($input: CreateCommitOnBranchInput!) {
+          createCommitOnBranch(input: $input) {
+            commit {
+              url
+              oid
+            }
           }
         }
-      }
-    `;
-    const input = {
-      branch: {
-        repositoryNameWithOwner: repo,
-        branchName: branch,
-      },
-      message: {
-        headline,
-        body,
-      },
-      fileChanges: {
-        additions,
-        deletions,
-      },
-      expectedHeadOid,
-    };
+      `;
 
-    core.info(`Creating commit on ${repo}@${branch}...`);
-    const response = await graphqlWithAuth<{
-      createCommitOnBranch: { commit: { url: string } };
-    }>(mutation, { input });
+      const input = {
+        branch: {
+          repositoryNameWithOwner: repo,
+          branchName: branch,
+        },
+        message: {
+          headline,
+          body,
+        },
+        fileChanges: {
+          additions: addsSubset.map((f) => ({
+            path: f.path,
+            contents: f.contentBase64,
+          })),
+          deletions: deletesSubset,
+        },
+        expectedHeadOid,
+      };
 
-    const commitUrl = response.createCommitOnBranch.commit.url;
-    core.info(`Success! New commit: ${commitUrl}`);
+      core.info(
+        `Creating commit #${i + 1} on ${repo}@${branch} with ${
+          addsSubset.length
+        } additions.`
+      );
+
+      const response = await graphqlWithAuth<{
+        createCommitOnBranch: { commit: { url: string; oid: string } };
+      }>(mutation, { input });
+
+      const commitInfo = response.createCommitOnBranch.commit;
+      core.info(`Success! New commit: ${commitInfo.url}`);
+
+      // Update HEAD for the next chunk
+      expectedHeadOid = commitInfo.oid;
+    }
   } catch (error: any) {
     core.setFailed(error instanceof Error ? error.message : String(error));
   }
@@ -199,6 +226,9 @@ function parseMessage(msg: string): [string, string] {
   return [parts[0], parts[1] ?? ""];
 }
 
+/**
+ * Fallback for local HEAD if github.context.sha is not available
+ */
 async function getLocalHeadSHA(): Promise<string> {
   let headSha = "";
   const options = {
@@ -210,4 +240,51 @@ async function getLocalHeadSHA(): Promise<string> {
   };
   await exec("git", ["rev-parse", "HEAD"], options);
   return headSha.trim();
+}
+
+/**
+ * Takes an array of file additions (path, base64)
+ * and splits them into multiple commits if the combined
+ * base64 size would exceed maxSize. Deletions are usually negligible,
+ * but we can either apply them to the first chunk or distribute them similarly.
+ */
+function chunkChangesBySize(
+  additions: { path: string; contentBase64: string }[],
+  deletions: { path: string }[],
+  maxSize: number
+): {
+  chunkedAdditions: { path: string; contentBase64: string }[][];
+  chunkedDeletions: { path: string }[][];
+} {
+  const chunkedAdditions: { path: string; contentBase64: string }[][] = [];
+  const chunkedDeletions: { path: string }[][] = [];
+
+  let currentChunk: { path: string; contentBase64: string }[] = [];
+  let currentSize = 0;
+  let deletionsAdded = false;
+
+  for (const item of additions) {
+    const fileSize = item.contentBase64.length;
+    // If adding this item exceeds max size, close off the current chunk
+    if (currentSize + fileSize > maxSize && currentChunk.length > 0) {
+      chunkedAdditions.push(currentChunk);
+      // apply deletions only once (or distribute them if you prefer)
+      chunkedDeletions.push(deletionsAdded ? [] : deletions);
+
+      currentChunk = [];
+      currentSize = 0;
+      deletionsAdded = true;
+    }
+
+    currentChunk.push(item);
+    currentSize += fileSize;
+  }
+
+  // Final chunk
+  if (currentChunk.length > 0) {
+    chunkedAdditions.push(currentChunk);
+    chunkedDeletions.push(deletionsAdded ? [] : deletions);
+  }
+
+  return { chunkedAdditions, chunkedDeletions };
 }
